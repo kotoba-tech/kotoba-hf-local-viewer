@@ -10,23 +10,19 @@ Install `uv` if needed:
 python -m pip install uv
 ```
 
-Create a virtual environment:
+Sync the project environment from [`pyproject.toml`](/Users/qiancheng/Documents/test/pyproject.toml):
 
 ```bash
-uv venv
+uv sync
 ```
 
-Activate the virtual environment:
+This creates `.venv` and installs:
 
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-uv pip install datasets streamlit pandas pyarrow
-```
+- `datasets`
+- `streamlit`
+- `pandas`
+- `pyarrow`
+- `torch`
 
 Set your Hugging Face token:
 
@@ -37,6 +33,13 @@ export HF_TOKEN=your_hf_token
 ## Start Server
 
 ```bash
+uv run streamlit run app.py
+```
+
+If you prefer an activated virtual environment:
+
+```bash
+source .venv/bin/activate
 streamlit run app.py
 ```
 
