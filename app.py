@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 from typing import Any
 
 import numpy as np
@@ -20,8 +21,11 @@ def ensure_dataset_dict(ds_obj):
     return ds_obj
 
 
-def hf_dataset_to_folder_name(dataset_name: str) -> str:
+def hf_dataset_to_folder_name(dataset_name: str, config_name: str = "") -> str:
     cleaned = dataset_name.strip().replace("/", "_")
+    config_cleaned = config_name.strip().replace("/", "_")
+    if config_cleaned:
+        return f"{cleaned}__{config_cleaned}"
     return cleaned or "hf_dataset"
 
 
@@ -31,11 +35,13 @@ def load_local_dataset(
     path: str,
     builder_name: str,
     hf_dataset_name: str,
+    hf_config_name: str,
     hf_save_root: str,
 ):
     path = path.strip()
     builder_name = builder_name.strip()
     hf_dataset_name = hf_dataset_name.strip()
+    hf_config_name = hf_config_name.strip()
     hf_save_root = hf_save_root.strip() or "."
 
     if mode == "load_from_disk":
@@ -43,7 +49,10 @@ def load_local_dataset(
         return ensure_dataset_dict(ds), path
 
     if mode == "hf_dataset":
-        local_path = os.path.join(hf_save_root, hf_dataset_to_folder_name(hf_dataset_name))
+        local_path = os.path.join(
+            hf_save_root,
+            hf_dataset_to_folder_name(hf_dataset_name, hf_config_name),
+        )
         if os.path.exists(local_path) and not os.path.isdir(local_path):
             raise ValueError(f"Target local dataset path is not a directory: {local_path}")
 
@@ -51,7 +60,7 @@ def load_local_dataset(
             ds = load_from_disk(local_path)
         else:
             os.makedirs(hf_save_root, exist_ok=True)
-            ds = load_dataset(hf_dataset_name)
+            ds = load_dataset(hf_dataset_name, name=hf_config_name or None)
             ds.save_to_disk(local_path)
         return ensure_dataset_dict(ds), local_path
 
@@ -64,11 +73,28 @@ def load_local_dataset(
 
 
 def is_audio_like(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and ("array" in value or "path" in value or "bytes" in value)
-        and ("sampling_rate" in value or "array" in value or "path" in value or "bytes" in value)
-    )
+    if get_audio_payload(value) is not None:
+        return True
+    return hasattr(value, "get_all_samples") and hasattr(value, "metadata")
+
+
+def get_audio_payload(audio_value: Any) -> dict[str, Any] | None:
+    if (
+        isinstance(audio_value, dict)
+        and ("array" in audio_value or "path" in audio_value or "bytes" in audio_value)
+        and ("sampling_rate" in audio_value or "array" in audio_value or "path" in audio_value or "bytes" in audio_value)
+    ):
+        return audio_value
+
+    encoded = getattr(audio_value, "_hf_encoded", None)
+    if (
+        isinstance(encoded, dict)
+        and ("array" in encoded or "path" in encoded or "bytes" in encoded)
+        and ("sampling_rate" in encoded or "array" in encoded or "path" in encoded or "bytes" in encoded)
+    ):
+        return encoded
+
+    return None
 
 
 def sanitize_path_part(value: str) -> str:
@@ -90,11 +116,16 @@ def get_audio_column_dir(dataset_path: str, split: str, column_name: str) -> str
     )
 
 
-def get_audio_filename(audio_value: dict, row_id: int, column_name: str) -> str:
-    original_path = audio_value.get("path")
+def get_generated_audio_filename(row_id: int, column_name: str) -> str:
+    return f"{sanitize_path_part(column_name)}_{row_id:06d}.wav"
+
+
+def get_audio_filename(audio_value: Any, row_id: int, column_name: str) -> str:
+    payload = get_audio_payload(audio_value) or {}
+    original_path = payload.get("path")
     if original_path:
         return os.path.basename(original_path)
-    return f"{sanitize_path_part(column_name)}_{row_id:06d}.wav"
+    return get_generated_audio_filename(row_id, column_name)
 
 
 def get_audio_format(path_value: str | None) -> str:
@@ -106,6 +137,98 @@ def get_audio_format(path_value: str | None) -> str:
     if ext == ".ogg":
         return "audio/ogg"
     return "audio/wav"
+
+
+def get_audio_path_value(audio_value: Any) -> str | None:
+    payload = get_audio_payload(audio_value) or {}
+    path_value = payload.get("path")
+    return path_value if isinstance(path_value, str) and path_value else None
+
+
+def get_audio_bytes_value(audio_value: Any) -> bytes | None:
+    payload = get_audio_payload(audio_value) or {}
+    raw_bytes = payload.get("bytes")
+    if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+        return bytes(raw_bytes)
+    return None
+
+
+def get_audio_sampling_rate(audio_value: Any) -> int | None:
+    payload = get_audio_payload(audio_value) or {}
+    sampling_rate = payload.get("sampling_rate")
+    if isinstance(sampling_rate, (int, float)):
+        return int(sampling_rate)
+
+    metadata = getattr(audio_value, "metadata", None)
+    metadata_sr = getattr(metadata, "sample_rate", None)
+    if isinstance(metadata_sr, (int, float)):
+        return int(metadata_sr)
+
+    return None
+
+
+def normalize_audio_array(array: Any) -> np.ndarray:
+    if hasattr(array, "detach"):
+        array = array.detach().cpu().numpy()
+
+    arr = np.asarray(array)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    elif arr.ndim >= 2:
+        arr = np.squeeze(arr)
+        if arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[0] < arr.shape[1]:
+            arr = arr.T
+
+    return arr
+
+
+def get_audio_num_samples(audio_value: Any) -> int | None:
+    payload = get_audio_payload(audio_value) or {}
+    array = payload.get("array")
+    if array is not None:
+        try:
+            return int(normalize_audio_array(array).shape[0])
+        except Exception:
+            return None
+
+    metadata = getattr(audio_value, "metadata", None)
+    duration_seconds = getattr(metadata, "duration_seconds", None)
+    sample_rate = getattr(metadata, "sample_rate", None)
+    if isinstance(duration_seconds, (int, float)) and isinstance(sample_rate, (int, float)):
+        return int(round(duration_seconds * sample_rate))
+
+    if hasattr(audio_value, "get_all_samples"):
+        try:
+            samples = audio_value.get_all_samples()
+            return int(normalize_audio_array(samples.data).shape[0])
+        except Exception:
+            return None
+
+    return None
+
+
+def get_audio_array_and_sampling_rate(audio_value: Any) -> tuple[np.ndarray | None, int | None]:
+    payload = get_audio_payload(audio_value) or {}
+    array = payload.get("array")
+    sample_rate = get_audio_sampling_rate(audio_value)
+
+    if array is None and hasattr(audio_value, "get_all_samples"):
+        try:
+            samples = audio_value.get_all_samples()
+            array = samples.data
+            sample_rate = getattr(samples, "sample_rate", sample_rate)
+        except Exception:
+            array = None
+
+    if array is None or sample_rate is None:
+        return None, sample_rate
+
+    arr = normalize_audio_array(array)
+
+    if arr.dtype != np.float32 and arr.dtype != np.float64:
+        arr = arr.astype(np.float32)
+
+    return arr, int(sample_rate)
 
 
 def prepare_audio_files(ds, dataset_path: str, split: str, audio_columns: list[str]) -> dict[str, str]:
@@ -129,19 +252,28 @@ def prepare_audio_files(ds, dataset_path: str, split: str, audio_columns: list[s
         row = ds[row_idx]
         for col, col_dir in pending_columns.items():
             audio_value = row.get(col)
-            if not isinstance(audio_value, dict):
+            if not is_audio_like(audio_value):
                 continue
 
-            audio_bytes = audio_value.get("bytes")
-            if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
+            original_file_path = os.path.join(col_dir, get_audio_filename(audio_value, row_idx, col))
+            generated_file_path = os.path.join(col_dir, get_generated_audio_filename(row_idx, col))
+            if os.path.exists(original_file_path) or os.path.exists(generated_file_path):
                 continue
 
-            file_path = os.path.join(col_dir, get_audio_filename(audio_value, row_idx, col))
-            if os.path.exists(file_path):
+            audio_bytes = get_audio_bytes_value(audio_value)
+            if audio_bytes is not None:
+                with open(original_file_path, "wb") as f:
+                    f.write(audio_bytes)
                 continue
 
-            with open(file_path, "wb") as f:
-                f.write(audio_bytes)
+            raw_path = get_audio_path_value(audio_value)
+            if raw_path and os.path.exists(raw_path):
+                shutil.copyfile(raw_path, original_file_path)
+                continue
+
+            arr, sr = get_audio_array_and_sampling_rate(audio_value)
+            if arr is not None and sr is not None:
+                sf.write(generated_file_path, arr, sr, format="WAV")
 
         if row_idx == total_rows - 1 or (row_idx + 1) % update_every == 0:
             done = row_idx + 1
@@ -154,17 +286,17 @@ def prepare_audio_files(ds, dataset_path: str, split: str, audio_columns: list[s
 
 
 def resolve_audio_path(
-    audio_value: dict,
+    audio_value: Any,
     dataset_path: str,
     split: str,
     column_name: str,
     row_id: int,
     audio_dirs: dict[str, str],
 ) -> str | None:
-    if not isinstance(audio_value, dict):
+    if not is_audio_like(audio_value):
         return None
 
-    raw_path = audio_value.get("path")
+    raw_path = get_audio_path_value(audio_value)
     if raw_path and os.path.isabs(raw_path) and os.path.exists(raw_path):
         return raw_path
 
@@ -173,44 +305,39 @@ def resolve_audio_path(
     if os.path.exists(candidate):
         return candidate
 
+    generated_candidate = os.path.join(column_dir, get_generated_audio_filename(row_id, column_name))
+    if os.path.exists(generated_candidate):
+        return generated_candidate
+
     if raw_path and os.path.exists(raw_path):
         return raw_path
 
     return None
 
 
-def to_audio_bytes(audio_value: dict, local_path: str | None = None) -> tuple[bytes | None, str]:
+def to_audio_bytes(audio_value: Any, local_path: str | None = None) -> tuple[bytes | None, str]:
     """
     Convert a Hugging Face Audio cell into bytes plus a format string for st.audio().
     """
-    if not isinstance(audio_value, dict):
+    if not is_audio_like(audio_value):
         return None, "audio/wav"
 
     if local_path and os.path.exists(local_path):
         with open(local_path, "rb") as f:
             return f.read(), get_audio_format(local_path)
 
-    raw_bytes = audio_value.get("bytes")
-    if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
-        return bytes(raw_bytes), get_audio_format(audio_value.get("path"))
+    raw_bytes = get_audio_bytes_value(audio_value)
+    if raw_bytes is not None:
+        return raw_bytes, get_audio_format(get_audio_path_value(audio_value))
 
-    array = audio_value.get("array", None)
-    sr = audio_value.get("sampling_rate", None)
-
-    # If decoded audio is available, use it directly
-    if array is not None and sr is not None:
-        arr = np.asarray(array)
-
-        # soundfile expects shape (n,) or (n, channels)
-        if arr.dtype != np.float32 and arr.dtype != np.float64:
-            arr = arr.astype(np.float32)
-
+    arr, sr = get_audio_array_and_sampling_rate(audio_value)
+    if arr is not None and sr is not None:
         buf = io.BytesIO()
         sf.write(buf, arr, sr, format="WAV")
         return buf.getvalue(), "audio/wav"
 
     # Fallback: raw file path
-    path = audio_value.get("path", None)
+    path = get_audio_path_value(audio_value)
     if path and os.path.exists(path):
         with open(path, "rb") as f:
             return f.read(), get_audio_format(path)
@@ -219,18 +346,16 @@ def to_audio_bytes(audio_value: dict, local_path: str | None = None) -> tuple[by
 
 
 def summarize_value(v: Any) -> str:
+    if is_audio_like(v):
+        sr = get_audio_sampling_rate(v) or "unknown"
+        n = get_audio_num_samples(v)
+        if n is not None:
+            return f"[audio] sr={sr}, samples={n}"
+        path = get_audio_path_value(v)
+        if path:
+            return f"[audio] {path}"
+        return f"[audio] sr={sr}"
     if isinstance(v, dict):
-        if is_audio_like(v):
-            sr = v.get("sampling_rate", "unknown")
-            arr = v.get("array")
-            if arr is not None:
-                try:
-                    n = len(arr)
-                except Exception:
-                    n = "unknown"
-                return f"[audio] sr={sr}, samples={n}"
-            if v.get("path"):
-                return f"[audio] {v['path']}"
         return json.dumps(v, ensure_ascii=False)[:200]
     if isinstance(v, list):
         return json.dumps(v, ensure_ascii=False)[:200]
@@ -254,6 +379,7 @@ with st.sidebar:
     path = ""
     builder_name = ""
     hf_dataset_name = ""
+    hf_config_name = ""
     hf_save_root = "."
 
     if mode == "hf_dataset":
@@ -262,14 +388,20 @@ with st.sidebar:
             value="",
             help="Example: your_org/your_dataset",
         )
+        hf_config_name = st.text_input(
+            "HF config name (optional)",
+            value="",
+            help="Example: default, en, or another dataset configuration name.",
+        )
         hf_save_root = st.text_input(
             "Local save root",
             value=".",
-            help="The dataset will be saved in a subfolder named from the dataset id.",
+            help="The dataset will be saved in a subfolder named from the dataset id and config.",
         )
         if hf_dataset_name.strip():
             st.caption(
-                f"Local folder: {os.path.join(hf_save_root, hf_dataset_to_folder_name(hf_dataset_name))}"
+                "Local folder: "
+                f"{os.path.join(hf_save_root, hf_dataset_to_folder_name(hf_dataset_name, hf_config_name))}"
             )
     else:
         path = st.text_input("Path", value="./data")
@@ -287,7 +419,14 @@ if mode != "hf_dataset" and not path:
     st.stop()
 
 try:
-    ds_dict, dataset_path = load_local_dataset(mode, path, builder_name, hf_dataset_name, hf_save_root)
+    ds_dict, dataset_path = load_local_dataset(
+        mode,
+        path,
+        builder_name,
+        hf_dataset_name,
+        hf_config_name,
+        hf_save_root,
+    )
 except Exception as e:
     st.error(f"Failed to load dataset: {e}")
     st.stop()
@@ -351,10 +490,10 @@ with left:
         if is_audio_like(v):
             local_path = resolve_audio_path(v, dataset_path, split, k, int(row_id), audio_dirs)
             compact_row[k] = {
-                "path": v.get("path"),
+                "path": get_audio_path_value(v),
                 "local_path": local_path,
-                "sampling_rate": v.get("sampling_rate"),
-                "array_len": None if v.get("array") is None else len(v["array"]),
+                "sampling_rate": get_audio_sampling_rate(v),
+                "array_len": get_audio_num_samples(v),
             }
         else:
             compact_row[k] = v
@@ -369,14 +508,14 @@ with right:
             audio_val = row[col]
             st.markdown(f"**Column: `{col}`**")
 
-            sr = audio_val.get("sampling_rate", "unknown") if isinstance(audio_val, dict) else "unknown"
-            arr = audio_val.get("array", None) if isinstance(audio_val, dict) else None
-            path_val = audio_val.get("path", None) if isinstance(audio_val, dict) else None
+            sr = get_audio_sampling_rate(audio_val) or "unknown"
+            num_samples = get_audio_num_samples(audio_val)
+            path_val = get_audio_path_value(audio_val)
             local_path = resolve_audio_path(audio_val, dataset_path, split, col, int(row_id), audio_dirs)
 
             meta = {
                 "sampling_rate": sr,
-                "num_samples": None if arr is None else len(arr),
+                "num_samples": num_samples,
                 "path": path_val,
                 "local_path": local_path,
             }

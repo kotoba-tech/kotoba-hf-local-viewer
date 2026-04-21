@@ -1,0 +1,12 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+_audio_cache/
+.tmp_*/
+*_ts_check/
+cache-*.arrow
+data-*.arrow
+dataset_dict.json
+dataset_info.json
+state.json
