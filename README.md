@@ -48,11 +48,13 @@ streamlit run app.py
 ## What The App Supports
 
 - Load from a Hugging Face dataset name with an optional config name, save it to local disk, and reuse the saved copy on later runs
+- Stream the first `N` examples from a Hugging Face dataset for a quick preview without saving the full dataset locally
 - Load a dataset from `load_from_disk`
 - Load from local data files or a local directory
 
 When loading from Hugging Face Hub, the local folder name is derived from the dataset id by replacing `/` with `_`.
 If a config name is provided, it is appended to the folder name so different configs are cached separately.
+Streaming preview mode does not create this local dataset folder. It keeps only the selected split's first `N` streamed examples in memory, so total row count is unknown and browsing/search are limited to that preview buffer.
 
 Example:
 
