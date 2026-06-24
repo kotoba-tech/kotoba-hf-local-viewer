@@ -41,6 +41,16 @@ def hf_dataset_to_folder_name(dataset_name: str, config_name: str = "") -> str:
     return cleaned or "hf_dataset"
 
 
+def is_saved_to_disk_dataset(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+
+    has_dataset_dict = os.path.isfile(os.path.join(path, "dataset_dict.json"))
+    has_dataset_state = os.path.isfile(os.path.join(path, "state.json"))
+    has_dataset_info = os.path.isfile(os.path.join(path, "dataset_info.json"))
+    return has_dataset_dict or (has_dataset_state and has_dataset_info)
+
+
 @st.cache_resource(show_spinner=False)
 def load_local_dataset(
     mode: str,
@@ -81,7 +91,9 @@ def load_local_dataset(
         return ensure_dataset_dict(ds), f"hf://{hf_dataset_name}"
 
     # builder_name examples: parquet / csv / json / audiofolder
-    if builder_name:
+    if is_saved_to_disk_dataset(path):
+        ds = load_from_disk(path)
+    elif builder_name:
         ds = load_dataset(builder_name, data_dir=path)
     else:
         ds = load_dataset(path)
@@ -494,7 +506,10 @@ with st.sidebar:
         builder_name = st.text_input(
             "Builder (optional)",
             value="",
-            help="Examples: parquet, csv, json, audiofolder. Leave empty only if path itself is a dataset script / supported auto-load target."
+            help=(
+                "Examples: parquet, csv, json, audiofolder. Saved datasets from "
+                "save_to_disk are auto-detected and loaded with load_from_disk."
+            )
         )
 
 is_streaming_mode = mode == HF_STREAMING_MODE
@@ -582,9 +597,6 @@ else:
     audio_dirs = prepare_audio_files(ds, dataset_path, split, audio_columns) if audio_columns else {}
 
 st.subheader("Browse rows")
-limit_min = 1 if total_rows < 5 else 5
-limit_max = min(100, total_rows)
-limit_default = min(20, limit_max)
 start = st.number_input(
     "Start row",
     min_value=0,
@@ -592,7 +604,13 @@ start = st.number_input(
     value=0,
     step=1,
 )
-limit = st.slider("Rows to display", min_value=limit_min, max_value=limit_max, value=limit_default)
+if total_rows <= 5:
+    limit = total_rows
+    st.caption(f"Rows to display: {limit}")
+else:
+    limit_max = min(100, total_rows)
+    limit_default = min(20, limit_max)
+    limit = st.slider("Rows to display", min_value=5, max_value=limit_max, value=limit_default)
 end = min(start + limit, total_rows)
 
 df = make_display_df(row_source, start, end, include_audio_stats=not is_streaming_mode)
